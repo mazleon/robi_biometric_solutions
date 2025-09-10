@@ -32,11 +32,19 @@ class Settings(BaseSettings):
     faiss_cache_size: int = Field(default=100000, env="FAISS_CACHE_SIZE")  # Hot vectors in FAISS
     
     # Face processing configuration
-    model_name: str = Field(default="buffalo_l", env="MODEL_NAME")
-    detection_size: tuple = Field(default=(640, 640))  # Remove env to avoid parsing issues
+    model_name: str = Field(default="buffalo_l", env="MODEL_NAME", description="Primary recognition model.")
+    # Pluggable detector model. If None, uses the detector bundled with `model_name`.
+    # Example: 'scrfd_10g_bnkps' for a more powerful detector.
+    detector_model_name: Optional[str] = Field(default=None, env="DETECTOR_MODEL_NAME")
+    detection_size: tuple = Field(default=(640, 640), description="Input size for the detector model.")
     similarity_threshold: float = Field(default=0.45, env="SIMILARITY_THRESHOLD")
-    max_faces_per_image: int = Field(default=1, env="MAX_FACES_PER_IMAGE")
-    max_image_size: int = Field(default=1024, env="MAX_IMAGE_SIZE")  # Optimized for RTX 4090
+    max_faces_per_image: int = Field(default=10, env="MAX_FACES_PER_IMAGE", description="Max faces to process per image.")
+    max_image_size: int = Field(default=1600, env="MAX_IMAGE_SIZE", description="Max image dimension before resizing.")
+    
+    # Expert-level detector configuration
+    detection_threshold: float = Field(default=0.30, env="DETECTION_THRESHOLD", description="Primary confidence threshold for face detection.")
+    detector_nms_threshold: float = Field(default=0.4, env="NMS_THRESHOLD", description="Non-Maximum Suppression threshold.")
+    fallback_detection_threshold: float = Field(default=0.20, env="FALLBACK_DETECTION_THRESHOLD", description="Secondary threshold for fallback strategies.")
     
     # Vector processing configuration
     embedding_dimension: int = Field(default=512, env="EMBEDDING_DIMENSION")
@@ -46,10 +54,9 @@ class Settings(BaseSettings):
     use_gpu: bool = Field(default=True, env="USE_GPU")
     gpu_device_id: int = Field(default=0, env="GPU_DEVICE_ID")
     ctx_id: int = Field(default=0, env="CTX_ID")
-    gpu_memory_fraction: float = Field(default=0.95, env="GPU_MEMORY_FRACTION")  # Aggressive for RTX 4090
-    aggressive_optimizations: bool = Field(default=True, env="AGGRESSIVE_OPTIMIZATIONS")
-    
-    # ONNX Runtime providers with optimized order
+    gpu_memory_fraction: float = Field(default=0.90, env="GPU_MEMORY_FRACTION", description="Fraction of GPU VRAM to allocate.")
+    aggressive_gpu_optimizations: bool = Field(default=False, env="AGGRESSIVE_GPU_OPTIMIZATIONS", description="Enable experimental GPU optimizations like CUDA Graphs.")
+    batch_size: int = Field(default=1, env="BATCH_SIZE", description="Batch size for recognition (detector is always batch 1).")
     onnx_providers: List[str] = Field(
         default=["CUDAExecutionProvider", "CPUExecutionProvider"]
     )  # Remove env to avoid JSON parsing issues
@@ -60,7 +67,7 @@ class Settings(BaseSettings):
     # File upload configuration (optimized limits)
     max_file_size: int = Field(default=5 * 1024 * 1024, env="MAX_FILE_SIZE")  # 5MB for faster processing
     allowed_extensions: List[str] = Field(
-        default=[".jpg", ".jpeg", ".png", ".webp"]  # Optimized formats only
+        default=[".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"]
     )  # Remove env to avoid JSON parsing issues
     
     # Logging configuration

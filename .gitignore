@@ -36,3 +36,7 @@ wheels/
 *legacy_data*
 *.db
 "data/users.db" 
+
+# VGG Face folder ignore 
+vgg_face
+VGG_FACE
