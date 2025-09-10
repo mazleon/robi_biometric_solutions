@@ -1,0 +1,30 @@
+# Core web framework
+fastapi==0.116.1
+uvicorn==0.35.0
+pydantic==2.11.7
+python-multipart==0.0.20
+python-dotenv==1.1.1
+aiofiles==24.1.0
+pydantic-settings==2.10.1
+
+# Scientific computing and FAISS
+numpy==2.3.2
+faiss-gpu==1.12.0
+scipy==1.16.1
+scikit-learn==1.7.1
+
+# Computer vision
+opencv-python-headless==4.11.0.86
+pillow==11.3.0
+
+# Machine learning
+torch==2.1.2+cu121
+torchvision==0.16.2+cu121
+onnxruntime-gpu==1.22.1
+insightface==0.7.3
+
+# Database
+sqlalchemy==2.0.43
+
+# HTTP requests
+requests==2.31.0

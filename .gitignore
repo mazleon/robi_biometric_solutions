@@ -1,0 +1,38 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+*.ico
+*.bmp
+*.tiff
+*.heic
+*.heif
+*.raw
+*.cr2
+*.cr3
+*.nef
+*.orf
+
+# Logs
+*.log
+*.json  
+
+# Database
+*data*
+*legacy_data*
+*.db
+"data/users.db" 

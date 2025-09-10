@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  faiss-gpu-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: faiss-gpu-service
+    # Use the 'gpus' key for Docker Compose v2.6.0+ to request GPU access
+    gpus: all
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - EMBEDDING_DIM=512
+      - GPU_DEVICE_ID=0
+      - GPU_MEMORY_GB=16
+      - USE_FP16=true
+      - INDEX_TYPE=IndexFlatIP
+      - INDEX_PATH=/app/data/faiss_index.bin
+      - METADATA_PATH=/app/data/metadata.json
+      - HOST=0.0.0.0
+      - PORT=8001
+      - LOG_LEVEL=INFO
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./data:/app/data
+      - ../data:/legacy_data:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - face-verification-network
+
+  # Your main face verification service
+  face-verification:
+    build:
+      context: ..
+      dockerfile: Dockerfile.gpu
+    container_name: face-verification
+    depends_on:
+      faiss-gpu-service:
+        condition: service_healthy
+    environment:
+      - FAISS_SERVICE_URL=http://faiss-gpu-service:8001
+      - USE_FAISS_GPU=false  # Disable local FAISS since we use the service
+      - USE_GPU=true
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - face_data:/app/data
+    networks:
+      - face-verification-network
+
+volumes:
+  face_data:
+    driver: local
+
+networks:
+  face-verification-network:
+    driver: bridge

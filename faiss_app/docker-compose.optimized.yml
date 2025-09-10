@@ -1,0 +1,155 @@
+version: '3.8'
+
+services:
+  # Optimized FAISS GPU Service
+  faiss-gpu-optimized:
+    build:
+      context: .
+      dockerfile: Dockerfile.optimized
+    container_name: faiss-gpu-optimized
+    gpus: all
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - EMBEDDING_DIM=512
+      - GPU_DEVICE_ID=0
+      - GPU_MEMORY_GB=16
+      - USE_FP16=true
+      - INDEX_TYPE=IndexFlatIP  # Options: IndexFlatIP, IndexIVFFlat, IndexHNSW
+      - INDEX_PATH=/app/data/faiss_index.bin
+      - METADATA_PATH=/app/data/metadata.json
+      - HOST=0.0.0.0
+      - PORT=8001
+      - LOG_LEVEL=INFO
+      - BATCH_SIZE=64
+      - SEARCH_NPROBE=32
+      - HNSW_EF_CONSTRUCTION=200
+      - HNSW_EF_SEARCH=50
+      - USE_MEMORY_MAPPING=true
+      - SAVE_INTERVAL_SECONDS=30
+      - ENABLE_PERFORMANCE_METRICS=true
+      - VECTOR_DB_TYPE=faiss  # Options: faiss, chromadb, qdrant
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./data:/app/data
+      - ../data:/legacy_data:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - face-verification-network
+
+  # ChromaDB Alternative Service
+  chromadb-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.optimized
+    container_name: chromadb-service
+    environment:
+      - EMBEDDING_DIM=512
+      - HOST=0.0.0.0
+      - PORT=8002
+      - LOG_LEVEL=INFO
+      - VECTOR_DB_TYPE=chromadb
+      - INDEX_PATH=/app/data/chromadb
+      - METADATA_PATH=/app/data/chromadb_metadata.json
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - face-verification-network
+    profiles:
+      - chromadb
+
+  # Qdrant Alternative Service
+  qdrant-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.optimized
+    container_name: qdrant-service
+    environment:
+      - EMBEDDING_DIM=512
+      - HOST=0.0.0.0
+      - PORT=8003
+      - LOG_LEVEL=INFO
+      - VECTOR_DB_TYPE=qdrant
+      - INDEX_PATH=/app/data/qdrant_db
+      - METADATA_PATH=/app/data/qdrant_metadata.json
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - face-verification-network
+    profiles:
+      - qdrant
+
+  # Performance Comparison Service
+  performance-tester:
+    build:
+      context: .
+      dockerfile: Dockerfile.optimized
+    container_name: performance-tester
+    environment:
+      - FAISS_URL=http://faiss-gpu-optimized:8001
+      - CHROMADB_URL=http://chromadb-service:8002
+      - QDRANT_URL=http://qdrant-service:8003
+    volumes:
+      - ./performance_tests:/app/performance_tests
+      - ./data:/app/data
+    depends_on:
+      - faiss-gpu-optimized
+    networks:
+      - face-verification-network
+    profiles:
+      - testing
+    command: ["python", "/app/performance_tests/run_benchmarks.py"]
+
+  # Your main face verification service
+  face-verification:
+    build:
+      context: ..
+      dockerfile: Dockerfile.gpu
+    container_name: face-verification
+    depends_on:
+      faiss-gpu-optimized:
+        condition: service_healthy
+    environment:
+      - FAISS_SERVICE_URL=http://faiss-gpu-optimized:8001
+      - USE_FAISS_GPU=false  # Disable local FAISS since we use the service
+      - USE_GPU=true
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - face_data:/app/data
+    networks:
+      - face-verification-network
+
+volumes:
+  face_data:
+    driver: local
+
+networks:
+  face-verification-network:
+    driver: bridge
