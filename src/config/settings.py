@@ -36,7 +36,8 @@ class Settings(BaseSettings):
     # Pluggable detector model. If None, uses the detector bundled with `model_name`.
     # Example: 'scrfd_10g_bnkps' for a more powerful detector.
     detector_model_name: Optional[str] = Field(default=None, env="DETECTOR_MODEL_NAME")
-    detection_size: tuple = Field(default=(640, 640), description="Input size for the detector model.")
+    detection_size_width: int = Field(default=224, env="DETECTION_SIZE_WIDTH", description="Width for face detection input size.")
+    detection_size_height: int = Field(default=224, env="DETECTION_SIZE_HEIGHT", description="Height for face detection input size.")
     similarity_threshold: float = Field(default=0.45, env="SIMILARITY_THRESHOLD")
     max_faces_per_image: int = Field(default=10, env="MAX_FACES_PER_IMAGE", description="Max faces to process per image.")
     max_image_size: int = Field(default=1600, env="MAX_IMAGE_SIZE", description="Max image dimension before resizing.")
@@ -158,6 +159,11 @@ class Settings(BaseSettings):
             self.ctx_id = -1
             logger.info("CPU processing mode enabled.")
 
+    @property
+    def detection_size(self) -> tuple:
+        """Get detection size as tuple from width and height settings."""
+        return (self.detection_size_width, self.detection_size_height)
+
     def get_runtime_info(self) -> dict[str, Any]:
         """Get current runtime configuration information."""
         return {
@@ -168,7 +174,8 @@ class Settings(BaseSettings):
             "model_name": self.model_name,
             "batch_size": self.batch_size,
             "qdrant_enabled": True,
-            "max_image_size": self.max_image_size
+            "max_image_size": self.max_image_size,
+            "detection_size": self.detection_size
         }
     
     @property

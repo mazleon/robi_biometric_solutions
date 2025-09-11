@@ -40,3 +40,15 @@ wheels/
 # VGG Face folder ignore 
 vgg_face
 VGG_FACE
+
+# FAISS GPU Cache Configuration
+faiss_app
+
+
+# Ignore logs
+logs/*
+*logs
+*log
+*.log
+
+

@@ -271,67 +271,81 @@ class FaceProcessor:
             # Handle EXIF orientation first
             image = ImageOps.exif_transpose(image)
             
-            # Convert to RGB with proper color space handling
+            # Force RGB conversion early to prevent channel corruption
+            original_mode = image.mode
             if image.mode != 'RGB':
                 if image.mode == 'RGBA':
                     # Handle transparency properly
                     background = Image.new('RGB', image.size, (255, 255, 255))
                     background.paste(image, mask=image.split()[-1])
                     image = background
+                elif image.mode in ['P', 'L', '1']:  # Palette, Grayscale, Binary
+                    image = image.convert('RGB')
                 else:
+                    # Force conversion for any other mode
+                    logger.warning(f"Converting unusual image mode {original_mode} to RGB")
                     image = image.convert('RGB')
             
-            # Intelligent resizing - preserve small faces
-            width, height = image.size
-            max_size = settings.max_image_size  # Use full configured size
+            # Resize to detection size for consistent processing
+            detection_width, detection_height = settings.detection_size
+            original_size = image.size
             
-            # Calculate minimum face size (assume 20px minimum face)
-            min_face_size = 20
-            min_dimension = min(width, height)
+            # Always resize to detection size for consistent face detection
+            if image.size != (detection_width, detection_height):
+                image = image.resize((detection_width, detection_height), Image.Resampling.LANCZOS)
+                logger.debug(f"Resized image from {original_size} to detection size: {settings.detection_size}")
             
-            # Only resize if image is significantly larger AND won't destroy small faces
-            if max(width, height) > max_size and min_dimension > min_face_size * 4:
-                # Use high-quality resampling for better face preservation
-                ratio = max_size / max(width, height)
-                new_width = max(int(width * ratio), min_face_size * 2)
-                new_height = max(int(height * ratio), min_face_size * 2)
-                image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            
-            # Enhance image quality for better detection
-            if min_dimension < 400:  # Enhance small/low-quality images
-                # Slight sharpening for small images
+            # Enhance image quality for better detection (only if small detection size)
+            if min(detection_width, detection_height) < 400:
+                # Slight sharpening for small detection sizes
                 image = ImageEnhance.Sharpness(image).enhance(1.1)
                 # Slight contrast enhancement
                 image = ImageEnhance.Contrast(image).enhance(1.05)
             
-            # Convert to numpy with optimal memory layout
-            img_array = np.ascontiguousarray(np.array(image, dtype=np.uint8))
+            # Convert to numpy with strict validation
+            img_array = np.array(image, dtype=np.uint8)
             
-            # Robust shape validation and correction
+            # Ensure we have exactly 3 channels (RGB)
             if len(img_array.shape) == 2:  # Grayscale
                 img_array = np.stack([img_array] * 3, axis=-1)
             elif len(img_array.shape) == 3:
-                if img_array.shape[2] == 1:  # Single channel
-                    img_array = np.repeat(img_array, 3, axis=2)
-                elif img_array.shape[2] == 4:  # RGBA
-                    img_array = img_array[:, :, :3]  # Drop alpha
-                elif img_array.shape[2] != 3:
-                    raise ValueError(f"Unsupported number of channels: {img_array.shape[2]}")
+                if img_array.shape[2] != 3:
+                    logger.error(f"Image array has {img_array.shape[2]} channels after RGB conversion, recreating image")
+                    # Force recreation from PIL image
+                    img_array = np.zeros((detection_height, detection_width, 3), dtype=np.uint8)
+                    try:
+                        # Try to get RGB data directly from PIL
+                        rgb_data = image.tobytes('raw', 'RGB')
+                        expected_size = detection_width * detection_height * 3
+                        if len(rgb_data) == expected_size:
+                            img_array = np.frombuffer(rgb_data, dtype=np.uint8).reshape((detection_height, detection_width, 3))
+                        else:
+                            logger.warning(f"RGB data size mismatch: {len(rgb_data)} != {expected_size}, using fallback")
+                            # Create a simple test pattern
+                            img_array[:] = 128  # Gray image
+                    except Exception as rgb_error:
+                        logger.error(f"Failed to extract RGB data: {rgb_error}")
+                        img_array[:] = 128  # Gray fallback
             else:
-                raise ValueError(f"Unsupported image shape: {img_array.shape}")
+                logger.error(f"Invalid image dimensions: {img_array.shape}")
+                img_array = np.full((detection_height, detection_width, 3), 128, dtype=np.uint8)
+            
+            # Final validation
+            if img_array.shape != (detection_height, detection_width, 3):
+                logger.error(f"Final array shape validation failed: {img_array.shape}")
+                img_array = np.full((detection_height, detection_width, 3), 128, dtype=np.uint8)
+            
+            # Make contiguous for performance
+            img_array = np.ascontiguousarray(img_array)
             
             return img_array
             
         except Exception as e:
             logger.error(f"Image preprocessing failed: {e}")
-            # Robust fallback
-            try:
-                if image.mode != 'RGB':
-                    image = image.convert('RGB')
-                return np.ascontiguousarray(np.array(image, dtype=np.uint8))
-            except:
-                # Last resort: create a dummy image
-                return np.zeros((100, 100, 3), dtype=np.uint8)
+            # Create a valid detection-sized image as fallback
+            detection_width, detection_height = settings.detection_size
+            logger.warning(f"Creating fallback image with detection size: {settings.detection_size}")
+            return np.full((detection_height, detection_width, 3), 128, dtype=np.uint8)
     
     def _preprocess_image(self, image: Image.Image) -> np.ndarray:
         """GPU-optimized image preprocessing for RTX 4090 (legacy method)."""
@@ -344,6 +358,11 @@ class FaceProcessor:
         max_faces = int(getattr(settings, 'max_faces_per_image', 5))
         
         try:
+            # Validate input array before detection
+            if len(img_array.shape) != 3 or img_array.shape[2] != 3:
+                logger.error(f"Invalid input array shape for detection: {img_array.shape}")
+                return []
+            
             # Primary detection at original scale
             faces = self.face_app.get(img_array, max_num=max_faces)
             if faces:
@@ -361,6 +380,11 @@ class FaceProcessor:
                         
                         scaled_image = original_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
                         scaled_array = self._preprocess_image_fast(scaled_image)
+                        
+                        # Validate scaled array before detection
+                        if len(scaled_array.shape) != 3 or scaled_array.shape[2] != 3:
+                            logger.warning(f"Invalid scaled array shape: {scaled_array.shape}, skipping scale {scale}")
+                            continue
                         
                         # Use lower threshold for close-up detection
                         scale_faces = self._detect_with_threshold(scaled_array, 0.2)
@@ -400,6 +424,11 @@ class FaceProcessor:
                         
                         scaled_image = original_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
                         scaled_array = self._preprocess_image_fast(scaled_image)
+                        
+                        # Validate scaled array before detection
+                        if len(scaled_array.shape) != 3 or scaled_array.shape[2] != 3:
+                            logger.warning(f"Invalid scaled array shape: {scaled_array.shape}, skipping scale {scale}")
+                            continue
                         
                         # Detect faces at this scale with adaptive threshold
                         threshold = 0.25 if scale < 1.0 else 0.3

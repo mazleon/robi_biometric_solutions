@@ -69,12 +69,13 @@ class FaissEngine:
         self.use_gpu = settings.use_gpu and faiss.get_num_gpus() > 0
         self.gpu_device_id = settings.gpu_device_id
         
-        # Index configuration
+        # Index configuration with adaptive parameters
         self.index_type = "IVF"  # Default to IVF for production
-        self.nlist = 4096  # Number of clusters for IVF
-        self.nprobe = 64   # Number of clusters to search
-        self.m = 64        # PQ code size
-        self.nbits = 8     # Bits per PQ code
+        self.max_nlist = 4096  # Maximum number of clusters
+        self.nlist = 256  # Start with a smaller default that works with small datasets
+        self.nprobe = min(32, self.nlist)  # Start with smaller nprobe
+        self.m = 32       # PQ code size (reduced for smaller datasets)
+        self.nbits = 8    # Bits per PQ code
         
         # Index and metadata storage
         self.index: Optional[faiss.Index] = None
@@ -135,9 +136,11 @@ class FaissEngine:
             self.gpu_resources = None
     
     def _create_index(self):
-        """Create optimized FAISS index for face embeddings."""
+        """Create optimized FAISS index for face embeddings with adaptive parameters."""
         with self._lock:
             try:
+                logger.info(f"Creating {self.index_type} index with nlist={self.nlist}, nprobe={self.nprobe}")
+                
                 if self.index_type == "Flat":
                     # Exact search - best accuracy, slower for large datasets
                     self.index = faiss.IndexFlatIP(self.embedding_dim)  # Inner product for cosine
@@ -145,20 +148,51 @@ class FaissEngine:
                 elif self.index_type == "IVF":
                     # IVF with PQ - balanced speed/accuracy for production
                     quantizer = faiss.IndexFlatIP(self.embedding_dim)
-                    self.index = faiss.IndexIVFPQ(
-                        quantizer, 
-                        self.embedding_dim, 
-                        self.nlist,  # Number of clusters
-                        self.m,      # PQ segments
-                        self.nbits   # Bits per segment
-                    )
-                    self.index.nprobe = self.nprobe
+                    
+                    # Adjust parameters based on expected dataset size
+                    if not hasattr(self, 'nlist'):
+                        self.nlist = 256  # Default to smaller value
+                    
+                    # Ensure nlist is a power of 2 for optimal performance
+                    self.nlist = 2 ** int(np.log2(self.nlist) + 0.5)
+                    self.nlist = max(4, min(self.nlist, self.max_nlist))  # Keep within bounds
+                    
+                    # Adjust m (number of segments) based on embedding dimension
+                    self.m = min(32, self.embedding_dim // 4)  # Aim for 4 bytes per segment
+                    self.m = max(4, self.m)  # At least 4 segments
+                    
+                    # Ensure m divides embedding dimension evenly
+                    while self.embedding_dim % self.m != 0 and self.m > 1:
+                        self.m -= 1
+                    
+                    logger.info(f"Creating IVF index with nlist={self.nlist}, m={self.m}, nbits={self.nbits}")
+                    
+                    try:
+                        self.index = faiss.IndexIVFPQ(
+                            quantizer, 
+                            self.embedding_dim, 
+                            self.nlist,  # Number of clusters
+                            self.m,      # PQ segments
+                            self.nbits   # Bits per segment
+                        )
+                        self.index.nprobe = min(self.nprobe, self.nlist)
+                    except Exception as e:
+                        logger.error(f"Failed to create IVF index: {e}")
+                        logger.warning("Falling back to Flat index")
+                        self.index_type = "Flat"
+                        return self._create_index()
                     
                 elif self.index_type == "HNSW":
                     # HNSW - fastest search, more memory usage
-                    self.index = faiss.IndexHNSWFlat(self.embedding_dim, 32)
-                    self.index.hnsw.efConstruction = 200
-                    self.index.hnsw.efSearch = 64
+                    try:
+                        self.index = faiss.IndexHNSWFlat(self.embedding_dim, 32)
+                        self.index.hnsw.efConstruction = 200
+                        self.index.hnsw.efSearch = 64
+                    except Exception as e:
+                        logger.error(f"Failed to create HNSW index: {e}")
+                        logger.warning("Falling back to Flat index")
+                        self.index_type = "Flat"
+                        return self._create_index()
                 
                 else:
                     raise ValueError(f"Unsupported index type: {self.index_type}")
@@ -186,6 +220,73 @@ class FaissEngine:
         """Get the active index (GPU if available, otherwise CPU)."""
         return self.gpu_index if self.gpu_index is not None else self.index
     
+    def _get_optimal_nlist(self, num_vectors: int) -> int:
+        """Calculate optimal nlist based on dataset size."""
+        # Start with a minimum of 4 clusters for very small datasets
+        min_nlist = 4
+        # Cap at max_nlist (default 4096) or number of vectors, whichever is smaller
+        return min(max(num_vectors // 39, min_nlist), self.max_nlist)
+
+    def _prepare_embeddings(self, embeddings: np.ndarray) -> np.ndarray:
+        """Normalize embeddings for cosine similarity."""
+        embeddings = embeddings.astype('float32')
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms[norms == 0] = 1  # Avoid division by zero
+        return embeddings / norms
+
+    def _train_index(self, active_index, embeddings: np.ndarray):
+        """Train the index with proper validation and fallback."""
+        if not hasattr(active_index, 'train') or active_index.is_trained:
+            return
+
+        num_vectors = embeddings.shape[0]
+        
+        # For IVF indices, ensure we have enough training vectors
+        if hasattr(active_index, 'nlist'):
+            required_vectors = active_index.nlist * 39  # FAISS recommends 30-50x nlist
+            
+            if num_vectors < required_vectors:
+                # Reduce nlist to match available training data
+                old_nlist = active_index.nlist
+                new_nlist = self._get_optimal_nlist(num_vectors)
+                
+                if new_nlist < old_nlist:
+                    logger.warning(f"Reducing nlist from {old_nlist} to {new_nlist} for {num_vectors} training vectors")
+                    active_index.nlist = new_nlist
+                    active_index.nprobe = min(active_index.nprobe, new_nlist)
+        
+        try:
+            logger.info(f"Training FAISS {self.index_type} index with {num_vectors} vectors...")
+            if self.gpu_index is not None:
+                active_index.train(embeddings)
+            else:
+                self.index.train(embeddings)
+                if self.gpu_index is not None:
+                    self.gpu_index = faiss.index_cpu_to_gpu(
+                        self.gpu_resources, 
+                        self.gpu_device_id, 
+                        self.index
+                    )
+            logger.info("Index training completed successfully")
+            
+        except Exception as e:
+            logger.error(f"Index training failed: {e}")
+            # Fall back to Flat index if training fails
+            logger.warning("Falling back to Flat index")
+            self._fallback_to_flat_index()
+
+    def _fallback_to_flat_index(self):
+        """Fall back to a simple Flat index when training fails."""
+        logger.warning("Creating Flat index as fallback")
+        self.index_type = "Flat"
+        self.index = faiss.IndexFlatIP(self.embedding_dim)
+        if self.use_gpu and self.gpu_resources:
+            self.gpu_index = faiss.index_cpu_to_gpu(
+                self.gpu_resources,
+                self.gpu_device_id,
+                self.index
+            )
+
     def add_embeddings(
         self, 
         embeddings: np.ndarray, 
@@ -196,15 +297,15 @@ class FaissEngine:
         if len(embeddings) != len(user_ids) or len(embeddings) != len(metadata_list):
             raise ValueError("Embeddings, user_ids, and metadata must have same length")
         
+        if len(embeddings) == 0:
+            return []
+            
         with self._lock:
             start_time = time.time()
             
             try:
-                # Normalize embeddings for cosine similarity
-                embeddings_normalized = embeddings.copy()
-                norms = np.linalg.norm(embeddings_normalized, axis=1, keepdims=True)
-                norms[norms == 0] = 1  # Avoid division by zero
-                embeddings_normalized = embeddings_normalized / norms
+                # Normalize embeddings
+                embeddings_normalized = self._prepare_embeddings(embeddings)
                 
                 # Get FAISS IDs
                 faiss_ids = list(range(self._next_id, self._next_id + len(embeddings)))
@@ -212,29 +313,28 @@ class FaissEngine:
                 
                 # Train index if needed
                 active_index = self._get_active_index()
-                if not active_index.is_trained:
-                    if hasattr(active_index, 'train'):
-                        logger.info("Training FAISS index...")
-                        if self.gpu_index is not None:
-                            # Train on GPU
-                            active_index.train(embeddings_normalized.astype('float32'))
-                        else:
-                            # Train on CPU
-                            self.index.train(embeddings_normalized.astype('float32'))
-                            if self.gpu_index is not None:
-                                # Copy trained index to GPU
-                                self.gpu_index = faiss.index_cpu_to_gpu(
-                                    self.gpu_resources, 
-                                    self.gpu_device_id, 
-                                    self.index
-                                )
-                        logger.info("Index training completed")
+                self._train_index(active_index, embeddings_normalized)
+                active_index = self._get_active_index()  # Get potentially updated index
                 
-                # Add embeddings
-                active_index.add_with_ids(
-                    embeddings_normalized.astype('float32'), 
-                    np.array(faiss_ids, dtype=np.int64)
-                )
+                # Add embeddings with validation
+                try:
+                    active_index.add_with_ids(
+                        embeddings_normalized.astype('float32'), 
+                        np.array(faiss_ids, dtype=np.int64)
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to add embeddings: {e}")
+                    # If adding fails, try with a fresh Flat index
+                    if self.index_type != "Flat":
+                        logger.warning("Retrying with Flat index")
+                        self._fallback_to_flat_index()
+                        active_index = self._get_active_index()
+                        active_index.add_with_ids(
+                            embeddings_normalized.astype('float32'),
+                            np.array(faiss_ids, dtype=np.int64)
+                        )
+                    else:
+                        raise
                 
                 # Update metadata maps
                 for i, (faiss_id, user_id, metadata) in enumerate(zip(faiss_ids, user_ids, metadata_list)):
